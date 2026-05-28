@@ -5,6 +5,7 @@ const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000/api";
 export default function App() {
   const [email, setEmail] = useState("demo@example.com");
   const [user, setUser] = useState(null);
+  const [matchedUsers, setMatchedUsers] = useState([]);
   const [voiceName, setVoiceName] = useState("My Voice");
   const [voices, setVoices] = useState([]);
   const [selectedVoiceId, setSelectedVoiceId] = useState("");
@@ -17,6 +18,62 @@ export default function App() {
 
   const mediaRecorderRef = useRef(null);
   const chunksRef = useRef([]);
+
+  function audioBufferToWavBlob(audioBuffer) {
+    const numChannels = audioBuffer.numberOfChannels;
+    const sampleRate = audioBuffer.sampleRate;
+    const bitDepth = 16;
+    const bytesPerSample = bitDepth / 8;
+    const blockAlign = numChannels * bytesPerSample;
+    const dataLength = audioBuffer.length * blockAlign;
+    const buffer = new ArrayBuffer(44 + dataLength);
+    const view = new DataView(buffer);
+
+    function writeString(offset, value) {
+      for (let i = 0; i < value.length; i += 1) {
+        view.setUint8(offset + i, value.charCodeAt(i));
+      }
+    }
+
+    let offset = 0;
+    writeString(offset, "RIFF");
+    offset += 4;
+    view.setUint32(offset, 36 + dataLength, true);
+    offset += 4;
+    writeString(offset, "WAVE");
+    offset += 4;
+    writeString(offset, "fmt ");
+    offset += 4;
+    view.setUint32(offset, 16, true);
+    offset += 4;
+    view.setUint16(offset, 1, true);
+    offset += 2;
+    view.setUint16(offset, numChannels, true);
+    offset += 2;
+    view.setUint32(offset, sampleRate, true);
+    offset += 4;
+    view.setUint32(offset, sampleRate * blockAlign, true);
+    offset += 4;
+    view.setUint16(offset, blockAlign, true);
+    offset += 2;
+    view.setUint16(offset, bitDepth, true);
+    offset += 2;
+    writeString(offset, "data");
+    offset += 4;
+    view.setUint32(offset, dataLength, true);
+    offset += 4;
+
+    const channelData = Array.from({ length: numChannels }, (_, ch) => audioBuffer.getChannelData(ch));
+    for (let i = 0; i < audioBuffer.length; i += 1) {
+      for (let ch = 0; ch < numChannels; ch += 1) {
+        const sample = Math.max(-1, Math.min(1, channelData[ch][i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+        offset += 2;
+      }
+    }
+
+    return new Blob([buffer], { type: "audio/wav" });
+  }
 
   async function createUser() {
     const res = await fetch(`${API_BASE}/users`, {
@@ -33,7 +90,32 @@ export default function App() {
     }
     const data = await res.json();
     setUser(data);
+    setMatchedUsers([]);
     setStatus(`User ready: ${data.id}`);
+  }
+
+  async function searchUsers() {
+    if (!email.trim()) {
+      setStatus("Enter an email to search.");
+      return;
+    }
+    const res = await fetch(`${API_BASE}/users?email=${encodeURIComponent(email.trim())}`);
+    if (!res.ok) {
+      throw new Error("Failed to search users");
+    }
+    const data = await res.json();
+    setMatchedUsers(data);
+    if (!data.length) {
+      setStatus("No existing user found. You can create a new user.");
+      return;
+    }
+    setStatus(`Found ${data.length} user(s). Select one.`);
+  }
+
+  function selectUser(foundUser) {
+    setUser(foundUser);
+    setMatchedUsers([]);
+    setStatus(`Using existing user: ${foundUser.id}`);
   }
 
   async function fetchVoices(userId) {
@@ -69,7 +151,7 @@ export default function App() {
 
   async function uploadSample() {
     if (!selectedVoiceId || !sampleFile) {
-      setStatus("Select a voice and provide a .wav sample.");
+      setStatus("Select a voice and provide a .wav or .mp3 sample.");
       return;
     }
     const form = new FormData();
@@ -115,18 +197,31 @@ export default function App() {
 
   async function startRecording() {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const rec = new MediaRecorder(stream);
+    const preferredTypes = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+    const selectedType = preferredTypes.find((type) => MediaRecorder.isTypeSupported(type));
+    const rec = selectedType ? new MediaRecorder(stream, { mimeType: selectedType }) : new MediaRecorder(stream);
     chunksRef.current = [];
     rec.ondataavailable = (event) => {
       if (event.data.size > 0) {
         chunksRef.current.push(event.data);
       }
     };
-    rec.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: "audio/wav" });
-      const file = new File([blob], "recorded.wav", { type: "audio/wav" });
-      setSampleFile(file);
-      stream.getTracks().forEach((track) => track.stop());
+    rec.onstop = async () => {
+      try {
+        const recordedBlob = new Blob(chunksRef.current, { type: rec.mimeType || "audio/webm" });
+        const arrayBuffer = await recordedBlob.arrayBuffer();
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const decoded = await audioContext.decodeAudioData(arrayBuffer);
+        const wavBlob = audioBufferToWavBlob(decoded);
+        await audioContext.close();
+        const file = new File([wavBlob], "recorded.wav", { type: "audio/wav" });
+        setSampleFile(file);
+        setStatus("Recorded sample converted to WAV.");
+      } catch (err) {
+        setStatus("Recording conversion failed. Please upload a WAV or MP3 file manually.");
+      } finally {
+        stream.getTracks().forEach((track) => track.stop());
+      }
     };
     rec.start();
     mediaRecorderRef.current = rec;
@@ -159,8 +254,24 @@ export default function App() {
       <section>
         <h2>1) User</h2>
         <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" />
+        <button onClick={() => searchUsers().catch((err) => setStatus(err.message))}>Search User</button>
         <button onClick={() => createUser().catch((err) => setStatus(err.message))}>Create User</button>
         {user && <p>User ID: {user.id}</p>}
+        {matchedUsers.length > 0 && (
+          <select onChange={(e) => {
+            const foundUser = matchedUsers.find((item) => item.id === e.target.value);
+            if (foundUser) {
+              selectUser(foundUser);
+            }
+          }}>
+            <option value="">Select existing user</option>
+            {matchedUsers.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.email} ({item.id})
+              </option>
+            ))}
+          </select>
+        )}
       </section>
 
       <section>
@@ -183,7 +294,7 @@ export default function App() {
         <h2>3) Reference Audio</h2>
         <input
           type="file"
-          accept=".wav,audio/wav"
+          accept=".wav,.mp3,audio/wav,audio/mpeg,audio/mp3"
           onChange={(e) => setSampleFile(e.target.files?.[0] || null)}
         />
         {!recording ? (

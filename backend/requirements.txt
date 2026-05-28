@@ -6,7 +6,10 @@ psycopg[binary]
 alembic
 pydantic-settings
 TTS==0.22.0
+transformers==4.41.2
 torch
 torchaudio
+torchcodec
 librosa
 soundfile
+pydub
