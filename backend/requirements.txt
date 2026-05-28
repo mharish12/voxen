@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+SQLAlchemy
+psycopg[binary]
+alembic
+pydantic-settings
+TTS==0.22.0
+torch
+torchaudio
+librosa
+soundfile
