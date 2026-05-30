@@ -6,7 +6,7 @@ body {
 }
 
 .app {
-  max-width: 900px;
+  max-width: 960px;
   margin: 0 auto;
   padding: 20px;
 }
@@ -47,12 +47,105 @@ button {
   cursor: pointer;
 }
 
+button.primary {
+  background: #059669;
+  font-weight: bold;
+}
+
 button:hover {
-  background: #1d4ed8;
+  filter: brightness(0.95);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .status {
   padding: 8px 12px;
   background: #e0f2fe;
+  border-radius: 6px;
+}
+
+.hint {
+  font-size: 0.9rem;
+  color: #4b5563;
+  margin: 8px 0;
+}
+
+.hint.warn {
+  color: #b45309;
+  background: #fffbeb;
+  padding: 8px;
+  border-radius: 6px;
+}
+
+.checklist ul {
+  list-style: none;
+  padding: 0;
+}
+
+.checklist li {
+  padding: 4px 0;
+}
+
+.checklist li.done {
+  color: #059669;
+}
+
+.training-wizard .progress-bar {
+  font-weight: bold;
+}
+
+.sentence-list {
+  padding-left: 0;
+  list-style: none;
+}
+
+.sentence-list li {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.sentence-list li.sentence-done {
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+
+.sentence-text {
+  font-size: 1rem;
+  margin: 0 0 8px;
+}
+
+.sentence-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.upload-label {
+  cursor: pointer;
+  padding: 8px 12px;
+  background: #6b7280;
+  color: #fff;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.badge {
+  background: #dcfce7;
+  color: #166534;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+
+.job-status {
+  margin-top: 12px;
+  padding: 8px;
+  background: #f3f4f6;
   border-radius: 6px;
 }

@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     default_sample_rate: int = 24000
     max_text_length: int = 1200
     training_concurrency: int = 1
+    min_training_samples: int = 8
+    target_training_samples: int = 12
+    default_training_epochs: int = 50
+    default_training_batch_size: int = 2
+    default_training_learning_rate: float = 5e-6
+    ideal_reference_duration_min: int = 6
+    ideal_reference_duration_max: int = 30
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="TTS_")
 

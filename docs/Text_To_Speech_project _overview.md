@@ -6,7 +6,7 @@ Pillars of Text to Speech
 
 **Pillar 2 — Voice training pipeline.** Training adapts the base XTTS model to a specific user's voice characteristics. Here's the complete flow from raw recordings to a trained model:---
 
-**Pillar 3 & 4 — Voice profile and model weight management.** Every user gets a folder of their own. Here's the exact directory structure and database schema you'll maintain:---
+**Pillar 3 & 4 — Voice profile and model weight management.** Every user gets a folder of their own. Here's the exact directory structure and database schema you'll maintain:
 
 **Pillar 5 — Audio generation and local setup.** Here's the inference flow (text → audio), and the exact local machine setup using Docker to keep everything isolated:Here's a summary of the full build plan to get started:
 

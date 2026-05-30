@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydub import AudioSegment
@@ -20,23 +20,27 @@ from app.inference import InferenceService, InferenceUnavailableError
 from app.logging_setup import RequestContextMiddleware, RequestIdFilter, setup_logging
 from app.migrations import run_migrations
 from app.models import SynthesisRequest, TrainedModel, User, VoiceProfile, VoiceSample
+from app.reference import build_combined_reference_wav, select_reference_samples
 from app.schemas import (
     PromoteModelIn,
     SynthesisRequestIn,
     TrainedModelRead,
     TrainingJobRead,
+    TrainingReadinessRead,
     TrainingRequestIn,
     UserCreate,
     UserRead,
     VoiceProfileCreate,
     VoiceProfileRead,
+    VoiceSampleRead,
 )
 from app.storage import StorageService
+from app.trainer import count_training_ready_samples
 from app.training import TrainTask, TrainingQueue, create_training_job
 
 storage = StorageService()
 inference = InferenceService()
-training_queue = TrainingQueue(storage=storage)
+training_queue = TrainingQueue(storage=storage, inference_service=inference)
 logger = logging.getLogger(__name__)
 
 
@@ -122,7 +126,7 @@ def delete_voice_profile(voice_id: str, db: Session = Depends(get_db)):
 async def upload_reference_sample(
     voice_id: str,
     file: UploadFile = File(...),
-    transcript: str | None = None,
+    transcript: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
     logger.info(
@@ -160,7 +164,7 @@ async def upload_reference_sample(
     processed_dir = storage.processed_dir(voice.user_id, voice.id)
     processed_path = processed_dir / f"{sample_id}.wav"
     try:
-        duration = preprocess_audio(raw_path, processed_path)
+        duration, original_duration = preprocess_audio(raw_path, processed_path)
     except ValueError as exc:
         logger.warning(
             "upload_sample_rejected voice_id=%s sample_id=%s filename=%s detail=%s",
@@ -183,18 +187,25 @@ async def upload_reference_sample(
         processed_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Failed to read audio. Please upload a valid WAV or MP3 file.") from exc
 
-    if duration < settings.min_reference_duration_seconds or duration > settings.max_reference_duration_seconds:
+    # Validate on pre-trim length so short pauses at start/end do not reject good takes.
+    check_duration = original_duration
+    if check_duration < settings.min_reference_duration_seconds or check_duration > settings.max_reference_duration_seconds:
         logger.warning(
-            "upload_sample_duration_invalid voice_id=%s sample_id=%s duration=%s",
+            "upload_sample_duration_invalid voice_id=%s sample_id=%s original_duration=%s trimmed_duration=%s",
             voice_id,
             sample_id,
+            original_duration,
             duration,
         )
         raw_path.unlink(missing_ok=True)
         processed_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=400,
-            detail=f"Audio duration must be between {settings.min_reference_duration_seconds}s and {settings.max_reference_duration_seconds}s",
+            detail=(
+                f"Recording is {check_duration:.1f}s; must be between "
+                f"{settings.min_reference_duration_seconds}s and {settings.max_reference_duration_seconds}s. "
+                "Record a bit longer (aim for 6–15 seconds per sentence)."
+            ),
         )
 
     sample = VoiceSample(
@@ -217,6 +228,34 @@ async def upload_reference_sample(
         processed_path,
     )
     return voice
+
+
+@app.get("/api/voices/{voice_id}/samples", response_model=list[VoiceSampleRead])
+def list_voice_samples(voice_id: str, db: Session = Depends(get_db)):
+    voice = db.get(VoiceProfile, voice_id)
+    if voice is None:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    return (
+        db.query(VoiceSample)
+        .filter(VoiceSample.voice_id == voice_id)
+        .order_by(VoiceSample.created_at.desc())
+        .all()
+    )
+
+
+@app.get("/api/voices/{voice_id}/training-readiness", response_model=TrainingReadinessRead)
+def training_readiness(voice_id: str, db: Session = Depends(get_db)):
+    voice = db.get(VoiceProfile, voice_id)
+    if voice is None:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    total, with_transcript = count_training_ready_samples(db, voice_id)
+    return TrainingReadinessRead(
+        sample_count=total,
+        with_transcript_count=with_transcript,
+        min_required=settings.min_training_samples,
+        target_count=settings.target_training_samples,
+        ready=with_transcript >= settings.min_training_samples,
+    )
 
 
 @app.post("/api/synthesize")
@@ -259,19 +298,19 @@ def synthesize(payload: SynthesisRequestIn, db: Session = Depends(get_db)):
         logger.warning("synthesize_text_too_long voice_id=%s text_chars=%s", payload.voice_id, len(payload.text))
         raise HTTPException(status_code=400, detail=f"Text length exceeds {settings.max_text_length} characters")
 
-    sample = (
-        db.query(VoiceSample)
-        .filter(VoiceSample.voice_id == voice.id)
-        .order_by(VoiceSample.created_at.desc())
-        .first()
-    )
-    log_step("sample_lookup", found=sample is not None)
-    if not sample:
+    ref_samples = select_reference_samples(db, voice.id, limit=3)
+    log_step("sample_lookup", found=bool(ref_samples), count=len(ref_samples))
+    if not ref_samples:
         logger.warning("synthesize_no_reference_sample voice_id=%s", voice.id)
         raise HTTPException(status_code=400, detail="No reference sample available for voice")
 
+    model = None
     model_version = payload.model_version
-    if model_version:
+    if payload.use_reference_only:
+        synthesis_mode = "reference"
+        model_path = None
+        log_step("model_lookup_skipped", use_reference_only=True)
+    elif model_version:
         model = (
             db.query(TrainedModel)
             .filter(TrainedModel.voice_id == voice.id, TrainedModel.model_version == model_version)
@@ -279,8 +318,9 @@ def synthesize(payload: SynthesisRequestIn, db: Session = Depends(get_db)):
         )
         log_step("model_lookup_specific", found=model is not None, model_version=model_version)
         if model is None:
-            logger.warning("synthesize_model_not_found voice_id=%s model_version=%s", voice.id, model_version)
             raise HTTPException(status_code=404, detail="Requested model version not found")
+        synthesis_mode = "trained"
+        model_path = Path(model.model_path)
     else:
         model = (
             db.query(TrainedModel)
@@ -289,13 +329,42 @@ def synthesize(payload: SynthesisRequestIn, db: Session = Depends(get_db)):
             .first()
         )
         model_version = model.model_version if model else None
-        log_step("model_lookup_default", found=model is not None, selected_model_version=model_version)
+        if model and Path(model.model_path).exists():
+            synthesis_mode = "trained"
+            model_path = Path(model.model_path)
+        else:
+            synthesis_mode = "reference"
+            model_path = None
+        log_step(
+            "model_lookup_default",
+            found=model is not None,
+            selected_model_version=model_version,
+            synthesis_mode=synthesis_mode,
+        )
+
+    ref_paths = [Path(s.file_path) for s in ref_samples]
+    if synthesis_mode == "reference" and len(ref_paths) > 1:
+        combined_path = storage.processed_dir(voice.user_id, voice.id) / f"ref_combined_{uuid4()}.wav"
+        speaker_input = build_combined_reference_wav(ref_paths, combined_path)
+        ref_paths_used = [str(speaker_input)]
+    else:
+        speaker_input = ref_paths[0] if synthesis_mode == "reference" else ref_paths
+        ref_paths_used = [str(p) for p in ref_paths]
+
+    log_step("reference_selected", paths=ref_paths_used, synthesis_mode=synthesis_mode)
 
     output_wav_path = storage.outputs_dir(voice.user_id, voice.id) / f"{uuid4()}.wav"
     output_mp3_path = output_wav_path.with_suffix(".mp3")
     try:
-        inference.synthesize(payload.text, Path(sample.file_path), payload.language, output_wav_path)
-        log_step("xtts_generation", wav_path=output_wav_path)
+        inference.synthesize(
+            payload.text,
+            speaker_input,
+            payload.language,
+            output_wav_path,
+            model_path=model_path,
+            synthesis_mode=synthesis_mode,
+        )
+        log_step("xtts_generation", wav_path=output_wav_path, synthesis_mode=synthesis_mode)
     except InferenceUnavailableError as exc:
         logger.error("synthesize_inference_unavailable voice_id=%s reason=%s", voice.id, str(exc))
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -329,19 +398,27 @@ def synthesize(payload: SynthesisRequestIn, db: Session = Depends(get_db)):
         input_text=payload.text,
         language=payload.language,
         output_path=str(output_mp3_path),
-        model_version=model_version,
+        model_version=model_version if synthesis_mode == "trained" else None,
         latency_ms=latency_ms,
     )
     db.add(req)
     db.commit()
     log_step("db_commit")
     logger.info(
-        "synthesize_success voice_id=%s output_path=%s latency_ms=%s",
+        "synthesize_success voice_id=%s output_path=%s latency_ms=%s synthesis_mode=%s model_version=%s reference_paths=%s",
         voice.id,
         output_mp3_path,
         latency_ms,
+        synthesis_mode,
+        model_version,
+        ref_paths_used,
     )
-    return FileResponse(path=output_mp3_path, media_type="audio/mpeg", filename="speech.mp3")
+    return FileResponse(
+        path=output_mp3_path,
+        media_type="audio/mpeg",
+        filename="speech.mp3",
+        headers={"x-synthesis-mode": synthesis_mode},
+    )
 
 
 @app.post("/api/train", response_model=TrainingJobRead)
@@ -353,6 +430,16 @@ async def train_voice(
     voice = db.get(VoiceProfile, payload.voice_id)
     if voice is None:
         raise HTTPException(status_code=404, detail="Voice not found")
+
+    _, with_transcript = count_training_ready_samples(db, voice.id)
+    if with_transcript < settings.min_training_samples:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Need at least {settings.min_training_samples} training samples with transcripts. "
+                f"Currently have {with_transcript}."
+            ),
+        )
 
     key = payload.idempotency_key or x_idempotency_key
     job = create_training_job(db, payload.voice_id, payload.epochs, key)
